@@ -1,21 +1,134 @@
 (() => {
   // Config
   const DRAFTS_LIMIT = 30;
-  const POST_DELAY_MS = 1500;    // delay between posts to be nice to the API
+  const BASE_POST_DELAY_MS = 4000; // steady-state delay between posts
   const MAX_RETRIES = 3;
-  const RETRY_DELAY_MS = 5000;
+  const RATE_LIMIT_BASE_DELAY_MS = 15000;
+  const MAX_RATE_LIMIT_DELAY_MS = 120000;
   const MAX_POST_TEXT_LENGTH = 1999;
+  const LOG_HISTORY_LIMIT = 250;
 
   let accessToken = null;
+  const runState = createInitialRunState();
 
-  // ── Helpers ──────────────────────────────────────────────
+  function createInitialRunState() {
+    return {
+      isRunning: false,
+      posted: 0,
+      skipped: 0,
+      failed: 0,
+      total: 0,
+      logs: [],
+      startedAt: null,
+      finishedAt: null,
+      postDelayMs: BASE_POST_DELAY_MS,
+      cooldownUntil: 0,
+    };
+  }
+
+  // Helpers
 
   function send(type, data = {}) {
-    chrome.runtime.sendMessage({ type, ...data });
+    chrome.runtime.sendMessage({ type, ...data }, () => {
+      void chrome.runtime.lastError;
+    });
   }
 
   function sleep(ms) {
-    return new Promise((r) => setTimeout(r, ms));
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  function getSerializableState() {
+    return {
+      isRunning: runState.isRunning,
+      posted: runState.posted,
+      skipped: runState.skipped,
+      failed: runState.failed,
+      total: runState.total,
+      logs: runState.logs.slice(),
+      startedAt: runState.startedAt,
+      finishedAt: runState.finishedAt,
+      postDelayMs: runState.postDelayMs,
+      cooldownUntil: runState.cooldownUntil,
+    };
+  }
+
+  function resetRunState() {
+    Object.assign(runState, createInitialRunState(), {
+      isRunning: true,
+      startedAt: Date.now(),
+    });
+  }
+
+  function emitLog(text, cls = "") {
+    runState.logs.push({ text, cls });
+    if (runState.logs.length > LOG_HISTORY_LIMIT) {
+      runState.logs.shift();
+    }
+    send("log", { text, cls });
+  }
+
+  function emitStats() {
+    send("stats", {
+      posted: runState.posted,
+      skipped: runState.skipped,
+      failed: runState.failed,
+      total: runState.total,
+    });
+  }
+
+  function finishRun() {
+    runState.isRunning = false;
+    runState.finishedAt = Date.now();
+    send("done");
+  }
+
+  function parseRetryAfterMs(retryAfterHeader) {
+    if (!retryAfterHeader) return null;
+
+    const seconds = Number(retryAfterHeader);
+    if (Number.isFinite(seconds)) {
+      return Math.max(0, seconds * 1000);
+    }
+
+    const retryDate = Date.parse(retryAfterHeader);
+    if (Number.isNaN(retryDate)) {
+      return null;
+    }
+
+    return Math.max(0, retryDate - Date.now());
+  }
+
+  async function waitForCooldown() {
+    const waitMs = runState.cooldownUntil - Date.now();
+
+    if (waitMs > 0) {
+      emitLog(`Cooling down for ${Math.ceil(waitMs / 1000)}s before the next post...`, "skip");
+      await sleep(waitMs);
+    }
+  }
+
+  function noteSuccessfulPost() {
+    runState.cooldownUntil = 0;
+    runState.postDelayMs = Math.max(
+      BASE_POST_DELAY_MS,
+      Math.floor(runState.postDelayMs * 0.85)
+    );
+  }
+
+  function noteRateLimit(res, attempt) {
+    const retryAfterMs = parseRetryAfterMs(res.headers.get("Retry-After"));
+    const backoffMs =
+      retryAfterMs ??
+      Math.min(MAX_RATE_LIMIT_DELAY_MS, RATE_LIMIT_BASE_DELAY_MS * 2 ** (attempt - 1));
+
+    runState.cooldownUntil = Date.now() + backoffMs;
+    runState.postDelayMs = Math.min(
+      MAX_RATE_LIMIT_DELAY_MS,
+      Math.max(runState.postDelayMs * 2, backoffMs)
+    );
+
+    return backoffMs;
   }
 
   async function getToken() {
@@ -63,7 +176,7 @@
     };
   }
 
-  // ── Fetch all draft pages ───────────────────────────────
+  // Fetch all draft pages
 
   async function fetchAllDrafts() {
     let cursor = null;
@@ -75,15 +188,14 @@
       let url = `/backend/project_y/profile/drafts/v2?limit=${DRAFTS_LIMIT}`;
       if (cursor) url += `&cursor=${encodeURIComponent(cursor)}`;
 
-      send("log", { text: `Fetching drafts page ${page}...` });
+      emitLog(`Fetching drafts page ${page}...`);
 
       const res = await fetch(url, { headers: authHeaders() });
       if (!res.ok) {
-        // If 401, try refreshing token once
         if (res.status === 401) {
-          send("log", { text: "Token expired, refreshing...", cls: "skip" });
+          emitLog("Token expired, refreshing...", "skip");
           await getToken();
-          continue; // retry same page
+          continue;
         }
         throw new Error("Drafts fetch failed: " + res.status);
       }
@@ -92,9 +204,7 @@
       if (!data.items || data.items.length === 0) break;
 
       allItems = allItems.concat(data.items);
-      send("log", {
-        text: `  Got ${data.items.length} drafts (${allItems.length} total)`,
-      });
+      emitLog(`  Got ${data.items.length} drafts (${allItems.length} total)`);
 
       if (!data.cursor) break;
       cursor = data.cursor;
@@ -103,18 +213,20 @@
     return allItems;
   }
 
-  // ── Post a single draft ─────────────────────────────────
+  // Post a single draft
 
   async function postDraft(draft, attempt = 1) {
-    // Determine the generation_id and kind for the post call
-    let generationId, kind, sourceText;
+    await waitForCooldown();
+
+    let generationId;
+    let kind;
+    let sourceText;
 
     if (draft.kind === "sora_draft") {
       generationId = draft.generation_id || draft.id;
       kind = "sora";
       sourceText = draft.prompt || draft.title || "";
     } else if (!draft.kind && draft.assets) {
-      // Edited/project item — use the project id with kind "sora_edit"
       generationId = draft.id;
       kind = "sora_edit";
       sourceText = draft.caption || "";
@@ -136,6 +248,7 @@
     });
 
     if (res.ok) {
+      noteSuccessfulPost();
       return {
         status: "ok",
         shortened: postText.shortened,
@@ -143,29 +256,28 @@
       };
     }
 
-    // Handle retries
     if (res.status === 401 && attempt <= MAX_RETRIES) {
-      send("log", { text: "  Token expired, refreshing...", cls: "skip" });
+      emitLog("  Token expired, refreshing...", "skip");
       await getToken();
       return postDraft(draft, attempt + 1);
     }
 
     if (res.status === 429 && attempt <= MAX_RETRIES) {
-      const wait = RETRY_DELAY_MS * attempt;
-      send("log", {
-        text: `  Rate limited, waiting ${wait / 1000}s (retry ${attempt}/${MAX_RETRIES})...`,
-        cls: "skip",
-      });
+      const wait = noteRateLimit(res, attempt);
+      emitLog(
+        `  Rate limited, waiting ${Math.ceil(wait / 1000)}s (retry ${attempt}/${MAX_RETRIES})...`,
+        "skip"
+      );
       await sleep(wait);
       return postDraft(draft, attempt + 1);
     }
 
     if (res.status >= 500 && attempt <= MAX_RETRIES) {
       const wait = RETRY_DELAY_MS * attempt;
-      send("log", {
-        text: `  Server error ${res.status}, retrying in ${wait / 1000}s (${attempt}/${MAX_RETRIES})...`,
-        cls: "skip",
-      });
+      emitLog(
+        `  Server error ${res.status}, retrying in ${wait / 1000}s (${attempt}/${MAX_RETRIES})...`,
+        "skip"
+      );
       await sleep(wait);
       return postDraft(draft, attempt + 1);
     }
@@ -178,80 +290,93 @@
     return { status: "fail", reason: errMsg };
   }
 
-  // ── Main flow ───────────────────────────────────────────
+  // Main flow
 
   async function publishAll() {
-    let posted = 0,
-      skipped = 0,
-      failed = 0,
-      total = 0;
+    if (runState.isRunning) {
+      return false;
+    }
+
+    resetRunState();
 
     try {
-      send("log", { text: "Authenticating..." });
+      emitStats();
+      emitLog("Authenticating...");
       await getToken();
-      send("log", { text: "Fetching all drafts..." });
+      emitLog("Fetching all drafts...");
 
       const drafts = await fetchAllDrafts();
-      total = drafts.length;
-      send("log", { text: `Found ${total} drafts.` });
-      send("stats", { posted, skipped, failed, total });
+      runState.total = drafts.length;
+      emitLog(`Found ${runState.total} drafts.`);
+      emitStats();
 
       for (let i = 0; i < drafts.length; i++) {
         const draft = drafts[i];
         const label = (draft.prompt || draft.caption || draft.id).substring(0, 50);
 
         if (draft.kind === "sora_content_violation") {
-          send("log", { text: `[${i + 1}/${total}] SKIP (violation): ${label}`, cls: "skip" });
-          skipped++;
-          send("stats", { posted, skipped, failed, total });
+          emitLog(`[${i + 1}/${runState.total}] SKIP (violation): ${label}`, "skip");
+          runState.skipped++;
+          emitStats();
           continue;
         }
 
-        send("log", { text: `[${i + 1}/${total}] Posting: ${label}` });
+        emitLog(`[${i + 1}/${runState.total}] Posting: ${label}`);
         const result = await postDraft(draft);
 
         if (result.status === "ok") {
-          send("log", { text: `  ✓ Posted!`, cls: "success" });
+          emitLog("  Posted.", "success");
           if (result.shortened) {
-            send("log", {
-              text: `  Shortened caption from ${result.originalLength} to ${MAX_POST_TEXT_LENGTH} characters.`,
-              cls: "skip",
-            });
+            emitLog(
+              `  Shortened caption from ${result.originalLength} to ${MAX_POST_TEXT_LENGTH} characters.`,
+              "skip"
+            );
           }
-          posted++;
+          runState.posted++;
         } else if (result.status === "skip") {
-          send("log", { text: `  ⊘ Skipped (${result.reason})`, cls: "skip" });
-          skipped++;
+          emitLog(`  Skipped (${result.reason})`, "skip");
+          runState.skipped++;
         } else {
-          send("log", { text: `  ✗ Failed: ${result.reason}`, cls: "error" });
-          failed++;
+          emitLog(`  Failed: ${result.reason}`, "error");
+          runState.failed++;
         }
 
-        send("stats", { posted, skipped, failed, total });
+        emitStats();
 
-        // Polite delay between posts
-        if (i < drafts.length - 1 && result.status === "ok") {
-          await sleep(POST_DELAY_MS);
+        if (i < drafts.length - 1) {
+          await sleep(runState.postDelayMs);
         }
       }
 
-      send("log", {
-        text: `\nDone! Posted: ${posted}, Skipped: ${skipped}, Failed: ${failed}`,
-        cls: "success",
-      });
-    } catch (e) {
-      send("log", { text: "Fatal error: " + e.message, cls: "error" });
+      emitLog(
+        `\nDone! Posted: ${runState.posted}, Skipped: ${runState.skipped}, Failed: ${runState.failed}`,
+        "success"
+      );
+    } catch (error) {
+      emitLog("Fatal error: " + error.message, "error");
+    } finally {
+      finishRun();
     }
 
-    send("done");
+    return true;
   }
 
-  // ── Listen for trigger from popup ───────────────────────
+  // Listen for popup messages
 
   chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (msg.action === "publish_all") {
+      if (runState.isRunning) {
+        sendResponse({ started: false, alreadyRunning: true, state: getSerializableState() });
+        return;
+      }
+
       publishAll();
-      sendResponse({ started: true });
+      sendResponse({ started: true, state: getSerializableState() });
+      return;
+    }
+
+    if (msg.action === "get_status") {
+      sendResponse(getSerializableState());
     }
   });
 })();

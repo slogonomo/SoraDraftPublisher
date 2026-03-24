@@ -2,6 +2,16 @@
 
 Chrome extension for publishing all visible Sora drafts from `sora.chatgpt.com`, while trimming any outgoing caption text to stay under 2000 characters.
 
+## Download
+
+Current packaged build: [SoraDraftPublisher-v1.3.zip](./SoraDraftPublisher-v1.3.zip)
+
+## Decompress
+
+1. Download [SoraDraftPublisher-v1.3.zip](./SoraDraftPublisher-v1.3.zip).
+2. Double-click the zip file in Finder to extract it, or run `unzip SoraDraftPublisher-v1.3.zip -d SoraDraftPublisher-v1.3`.
+3. In Chrome, load the extracted folder with **Load unpacked**.
+
 ## Install
 
 1. Open Chrome and go to `chrome://extensions`.

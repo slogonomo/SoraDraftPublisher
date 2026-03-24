@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <style>
+    body { width: 380px; font-family: system-ui, sans-serif; padding: 16px; background: #1a1a1a; color: #eee; }
+    h2 { margin: 0 0 8px; font-size: 16px; }
+    p.info { font-size: 12px; color: #999; margin: 0 0 12px; }
+    button { background: #fff; color: #000; border: none; border-radius: 8px; padding: 10px 16px; cursor: pointer; font-weight: 600; font-size: 14px; width: 100%; }
+    button:hover { background: #ddd; }
+    button:disabled { opacity: 0.4; cursor: not-allowed; }
+    #log { margin-top: 12px; background: #111; border-radius: 8px; padding: 10px; font-size: 11px; font-family: monospace; max-height: 300px; overflow-y: auto; white-space: pre-wrap; display: none; }
+    .stat { display: inline-block; background: #333; border-radius: 6px; padding: 4px 10px; margin: 2px; font-size: 12px; }
+    #stats { margin: 10px 0; }
+    .success { color: #4ade80; }
+    .error { color: #f87171; }
+    .skip { color: #facc15; }
+  </style>
+</head>
+<body>
+  <h2>Sora Bulk Publisher</h2>
+  <p class="info">Publishes all drafts with their existing captions, shortening any caption over 1999 characters first. Content-violation drafts are skipped. Must be on sora.chatgpt.com.</p>
+  <div id="stats"></div>
+  <button id="go">Publish All Drafts</button>
+  <div id="log"></div>
+  <script src="popup.js"></script>
+</body>
+</html>

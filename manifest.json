@@ -1,0 +1,16 @@
+{
+  "manifest_version": 3,
+  "name": "Sora Bulk Publisher",
+  "version": "1.1",
+  "description": "Publish all Sora drafts to public, trimming caption text below 2000 characters when needed",
+  "permissions": ["activeTab"],
+  "content_scripts": [
+    {
+      "matches": ["https://sora.chatgpt.com/*"],
+      "js": ["content.js"]
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html"
+  }
+}

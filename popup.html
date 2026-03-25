@@ -6,6 +6,12 @@
     h2 { margin: 0 0 8px; font-size: 16px; }
     p.info { font-size: 12px; color: #999; margin: 0 0 12px; }
     .status { margin: 0 0 12px; font-size: 12px; color: #cbd5e1; }
+    .controls { margin: 0 0 12px; padding: 12px; background: #111; border-radius: 8px; }
+    .controls label { display: block; font-size: 12px; margin-bottom: 8px; }
+    .controls .toggle { font-weight: 600; color: #eee; }
+    .controls .note { margin: 0; font-size: 11px; color: #999; line-height: 1.4; }
+    .seconds-row { display: flex; align-items: center; gap: 8px; }
+    .seconds-row input { width: 72px; padding: 6px 8px; border-radius: 6px; border: 1px solid #333; background: #1b1b1b; color: #eee; }
     button { background: #fff; color: #000; border: none; border-radius: 8px; padding: 10px 16px; cursor: pointer; font-weight: 600; font-size: 14px; width: 100%; }
     button:hover { background: #ddd; }
     button:disabled { opacity: 0.4; cursor: not-allowed; }
@@ -21,6 +27,15 @@
   <h2>Sora Bulk Publisher</h2>
   <p class="info">Publishes all drafts with their existing captions, shortening any caption over 1999 characters first. Content-violation drafts are skipped.</p>
   <div id="status" class="status">Ready. Open sora.chatgpt.com, then start publishing.</div>
+  <div class="controls">
+    <label class="toggle"><input type="checkbox" id="slowMode"> Use slow mode</label>
+    <label class="seconds-row" for="slowSeconds">
+      Delay between drafts
+      <input id="slowSeconds" type="number" min="1" step="1" value="30">
+      sec
+    </label>
+    <p class="note">Slow mode starts at this delay and doubles 429 cooldowns from there. With 30 seconds, retries are at least 60s, 120s, then 240s.</p>
+  </div>
   <div id="stats"></div>
   <button id="go">Publish All Drafts</button>
   <div id="log"></div>

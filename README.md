@@ -4,12 +4,12 @@ Chrome extension for publishing all visible Sora drafts from `sora.chatgpt.com`,
 
 ## Download
 
-Current packaged build: [SoraDraftPublisher-v1.3.zip](./SoraDraftPublisher-v1.3.zip)
+Current packaged build: [SoraDraftPublisher-v1.4.zip](./SoraDraftPublisher-v1.4.zip)
 
 ## Decompress
 
-1. Download [SoraDraftPublisher-v1.3.zip](./SoraDraftPublisher-v1.3.zip).
-2. Double-click the zip file in Finder to extract it, or run `unzip SoraDraftPublisher-v1.3.zip -d SoraDraftPublisher-v1.3`.
+1. Download [SoraDraftPublisher-v1.4.zip](./SoraDraftPublisher-v1.4.zip).
+2. Double-click the zip file in Finder to extract it, or run `unzip SoraDraftPublisher-v1.4.zip -d SoraDraftPublisher-v1.4`.
 3. In Chrome, load the extracted folder with **Load unpacked**.
 
 ## Install
@@ -32,3 +32,4 @@ Current packaged build: [SoraDraftPublisher-v1.3.zip](./SoraDraftPublisher-v1.3.
 - Draft captions longer than 1999 characters are shortened automatically before posting.
 - The current run stays attached to the active Sora tab, so reloading that tab will interrupt the in-progress publish job.
 - The publisher now slows itself down after `429 Too Many Requests` responses and keeps a longer cooldown before continuing.
+- Slow mode can be enabled from the popup with a custom per-draft delay. At the default 30 seconds, `429` retries back off to at least 60, 120, and 240 seconds.

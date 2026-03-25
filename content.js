@@ -1,15 +1,62 @@
 (() => {
   // Config
   const DRAFTS_LIMIT = 30;
-  const BASE_POST_DELAY_MS = 4000; // steady-state delay between posts
+  const FAST_POST_DELAY_MS = 4000;
+  const FAST_RATE_LIMIT_BASE_DELAY_MS = 15000;
+  const SERVER_RETRY_DELAY_MS = 5000;
   const MAX_RETRIES = 3;
-  const RATE_LIMIT_BASE_DELAY_MS = 15000;
-  const MAX_RATE_LIMIT_DELAY_MS = 120000;
+  const MAX_RATE_LIMIT_DELAY_MS = 600000;
   const MAX_POST_TEXT_LENGTH = 1999;
   const LOG_HISTORY_LIMIT = 250;
+  const DEFAULT_SLOW_MODE_SECONDS = 30;
 
   let accessToken = null;
   const runState = createInitialRunState();
+
+  function createDefaultPacing() {
+    return {
+      slowMode: false,
+      slowModeSeconds: DEFAULT_SLOW_MODE_SECONDS,
+    };
+  }
+
+  function normalizePacingSettings(settings = {}) {
+    const normalizedSeconds = Math.max(
+      1,
+      Math.floor(Number(settings.slowModeSeconds) || DEFAULT_SLOW_MODE_SECONDS)
+    );
+
+    return {
+      slowMode: Boolean(settings.slowMode),
+      slowModeSeconds: normalizedSeconds,
+    };
+  }
+
+  function getConfiguredBaseDelayMs(pacing = runState.pacing) {
+    if (!pacing.slowMode) {
+      return FAST_POST_DELAY_MS;
+    }
+
+    return Math.max(FAST_POST_DELAY_MS, pacing.slowModeSeconds * 1000);
+  }
+
+  function getRecommendedRateLimitBackoffMs(attempt, pacing = runState.pacing) {
+    const fastBackoffMs = Math.min(
+      MAX_RATE_LIMIT_DELAY_MS,
+      FAST_RATE_LIMIT_BASE_DELAY_MS * 2 ** (attempt - 1)
+    );
+
+    if (!pacing.slowMode) {
+      return fastBackoffMs;
+    }
+
+    const slowBackoffMs = Math.min(
+      MAX_RATE_LIMIT_DELAY_MS,
+      getConfiguredBaseDelayMs(pacing) * 2 ** attempt
+    );
+
+    return Math.max(fastBackoffMs, slowBackoffMs);
+  }
 
   function createInitialRunState() {
     return {
@@ -21,7 +68,8 @@
       logs: [],
       startedAt: null,
       finishedAt: null,
-      postDelayMs: BASE_POST_DELAY_MS,
+      pacing: createDefaultPacing(),
+      postDelayMs: FAST_POST_DELAY_MS,
       cooldownUntil: 0,
     };
   }
@@ -48,15 +96,20 @@
       logs: runState.logs.slice(),
       startedAt: runState.startedAt,
       finishedAt: runState.finishedAt,
+      pacing: { ...runState.pacing },
       postDelayMs: runState.postDelayMs,
       cooldownUntil: runState.cooldownUntil,
     };
   }
 
-  function resetRunState() {
+  function resetRunState(pacingSettings) {
+    const pacing = normalizePacingSettings(pacingSettings);
+
     Object.assign(runState, createInitialRunState(), {
       isRunning: true,
       startedAt: Date.now(),
+      pacing,
+      postDelayMs: getConfiguredBaseDelayMs(pacing),
     });
   }
 
@@ -81,6 +134,19 @@
     runState.isRunning = false;
     runState.finishedAt = Date.now();
     send("done");
+  }
+
+  function describePacing(pacing = runState.pacing) {
+    if (!pacing.slowMode) {
+      return "Fast mode: 4s between drafts, with 429 retries at 15s, 30s, then 60s.";
+    }
+
+    return (
+      `Slow mode: ${pacing.slowModeSeconds}s between drafts, with 429 retries at ` +
+      `${Math.ceil(getRecommendedRateLimitBackoffMs(1, pacing) / 1000)}s, ` +
+      `${Math.ceil(getRecommendedRateLimitBackoffMs(2, pacing) / 1000)}s, then ` +
+      `${Math.ceil(getRecommendedRateLimitBackoffMs(3, pacing) / 1000)}s.`
+    );
   }
 
   function parseRetryAfterMs(retryAfterHeader) {
@@ -111,21 +177,28 @@
   function noteSuccessfulPost() {
     runState.cooldownUntil = 0;
     runState.postDelayMs = Math.max(
-      BASE_POST_DELAY_MS,
+      getConfiguredBaseDelayMs(),
       Math.floor(runState.postDelayMs * 0.85)
     );
   }
 
   function noteRateLimit(res, attempt) {
-    const retryAfterMs = parseRetryAfterMs(res.headers.get("Retry-After"));
-    const backoffMs =
-      retryAfterMs ??
-      Math.min(MAX_RATE_LIMIT_DELAY_MS, RATE_LIMIT_BASE_DELAY_MS * 2 ** (attempt - 1));
+    const retryAfterMs = parseRetryAfterMs(res.headers.get("Retry-After")) || 0;
+    const recommendedMs = getRecommendedRateLimitBackoffMs(attempt);
+    const backoffMs = Math.min(
+      MAX_RATE_LIMIT_DELAY_MS,
+      Math.max(retryAfterMs, recommendedMs)
+    );
 
     runState.cooldownUntil = Date.now() + backoffMs;
     runState.postDelayMs = Math.min(
       MAX_RATE_LIMIT_DELAY_MS,
-      Math.max(runState.postDelayMs * 2, backoffMs)
+      Math.max(
+        getConfiguredBaseDelayMs(),
+        runState.postDelayMs * 2,
+        recommendedMs,
+        retryAfterMs
+      )
     );
 
     return backoffMs;
@@ -273,9 +346,9 @@
     }
 
     if (res.status >= 500 && attempt <= MAX_RETRIES) {
-      const wait = RETRY_DELAY_MS * attempt;
+      const wait = Math.max(getConfiguredBaseDelayMs(), SERVER_RETRY_DELAY_MS * attempt);
       emitLog(
-        `  Server error ${res.status}, retrying in ${wait / 1000}s (${attempt}/${MAX_RETRIES})...`,
+        `  Server error ${res.status}, retrying in ${Math.ceil(wait / 1000)}s (${attempt}/${MAX_RETRIES})...`,
         "skip"
       );
       await sleep(wait);
@@ -292,16 +365,17 @@
 
   // Main flow
 
-  async function publishAll() {
+  async function publishAll(pacingSettings) {
     if (runState.isRunning) {
       return false;
     }
 
-    resetRunState();
+    resetRunState(pacingSettings);
 
     try {
       emitStats();
       emitLog("Authenticating...");
+      emitLog(`Pacing: ${describePacing()}`);
       await getToken();
       emitLog("Fetching all drafts...");
 
@@ -370,7 +444,7 @@
         return;
       }
 
-      publishAll();
+      publishAll(msg.pacing);
       sendResponse({ started: true, state: getSerializableState() });
       return;
     }

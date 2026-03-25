@@ -4,22 +4,25 @@ const statsEl = document.getElementById("stats");
 const statusEl = document.getElementById("status");
 const slowModeEl = document.getElementById("slowMode");
 const slowSecondsEl = document.getElementById("slowSeconds");
+const randomOrderEl = document.getElementById("randomOrder");
 
-const DEFAULT_PACING = {
+const DEFAULT_SETTINGS = {
   slowMode: false,
   slowModeSeconds: 30,
+  randomOrder: false,
 };
 
 let activeTabId = null;
-let savedPacing = { ...DEFAULT_PACING };
+let savedSettings = { ...DEFAULT_SETTINGS };
 
-function normalizePacingSettings(settings = {}) {
+function normalizeSettings(settings = {}) {
   return {
     slowMode: Boolean(settings.slowMode),
     slowModeSeconds: Math.max(
       1,
-      Math.floor(Number(settings.slowModeSeconds) || DEFAULT_PACING.slowModeSeconds)
+      Math.floor(Number(settings.slowModeSeconds) || DEFAULT_SETTINGS.slowModeSeconds)
     ),
+    randomOrder: Boolean(settings.randomOrder),
   };
 }
 
@@ -58,23 +61,26 @@ function renderStats(state) {
   `;
 }
 
-function updatePacingControls(pacing, disabled = false) {
-  const normalized = normalizePacingSettings(pacing);
+function updateControls(settings, disabled = false) {
+  const normalized = normalizeSettings(settings);
   slowModeEl.checked = normalized.slowMode;
   slowSecondsEl.value = String(normalized.slowModeSeconds);
+  randomOrderEl.checked = normalized.randomOrder;
   slowModeEl.disabled = disabled;
   slowSecondsEl.disabled = disabled || !normalized.slowMode;
+  randomOrderEl.disabled = disabled;
 }
 
-function savePacingSettings(pacing) {
-  savedPacing = normalizePacingSettings(pacing);
-  chrome.storage.local.set(savedPacing);
+function saveSettings(settings) {
+  savedSettings = normalizeSettings(settings);
+  chrome.storage.local.set(savedSettings);
 }
 
-function readPacingFromForm() {
-  return normalizePacingSettings({
+function readSettingsFromForm() {
+  return normalizeSettings({
     slowMode: slowModeEl.checked,
     slowModeSeconds: slowSecondsEl.value,
+    randomOrder: randomOrderEl.checked,
   });
 }
 
@@ -88,24 +94,34 @@ function getEmptyState() {
   };
 }
 
-function getPacingSummary(pacing) {
-  if (!pacing?.slowMode) {
-    return "Fast mode is selected.";
-  }
+function getSettingsSummary(settings) {
+  const normalized = normalizeSettings(settings);
+  const pacingSummary = normalized.slowMode
+    ? `Slow mode is selected at ${normalized.slowModeSeconds}s between drafts.`
+    : "Fast mode is selected.";
+  const orderSummary = normalized.randomOrder
+    ? "Randomized publish order is on."
+    : "Posting stays in fetched order.";
 
-  return `Slow mode is selected at ${pacing.slowModeSeconds}s between drafts.`;
+  return `${pacingSummary} ${orderSummary}`;
 }
 
 function applyState(state) {
   renderStats(state);
   renderLogEntries(state.logs || []);
 
+  const stateSettings = {
+    slowMode: state.pacing?.slowMode,
+    slowModeSeconds: state.pacing?.slowModeSeconds,
+    randomOrder: state.randomOrder,
+  };
+
   if (state.isRunning) {
     btn.disabled = true;
     btn.textContent = "Publishing In This Tab...";
-    updatePacingControls(state.pacing || savedPacing, true);
+    updateControls(stateSettings, true);
     setStatus(
-      `Publishing continues in the page even if this popup closes. ${getPacingSummary(state.pacing)}`,
+      `Publishing continues in the page even if this popup closes. ${getSettingsSummary(stateSettings)}`,
       "success"
     );
     return;
@@ -113,12 +129,12 @@ function applyState(state) {
 
   btn.disabled = false;
   btn.textContent = "Publish All Drafts";
-  updatePacingControls(savedPacing, false);
+  updateControls(savedSettings, false);
 
   if ((state.logs || []).length) {
     setStatus("Last run finished. You can close and reopen this popup without losing the log.", "skip");
   } else {
-    setStatus(`Ready. Open sora.chatgpt.com, then start publishing. ${getPacingSummary(savedPacing)}`);
+    setStatus(`Ready. Open sora.chatgpt.com, then start publishing. ${getSettingsSummary(savedSettings)}`);
   }
 }
 
@@ -128,7 +144,7 @@ function handleRuntimeMessage(msg) {
   if (msg.type === "done") {
     btn.disabled = false;
     btn.textContent = "Publish All Drafts";
-    updatePacingControls(savedPacing, false);
+    updateControls(savedSettings, false);
     setStatus("Publishing finished. The log stays here when you reopen the popup.", "success");
   }
 }
@@ -170,7 +186,7 @@ function syncPopupState() {
       btn.textContent = "Publish All Drafts";
       renderStats(getEmptyState());
       renderLogEntries([]);
-      updatePacingControls(savedPacing, false);
+      updateControls(savedSettings, false);
       setStatus("Navigate to sora.chatgpt.com first.", "error");
       return;
     }
@@ -179,7 +195,7 @@ function syncPopupState() {
       if (error) {
         renderStats(getEmptyState());
         renderLogEntries([]);
-        updatePacingControls(savedPacing, false);
+        updateControls(savedSettings, false);
         setStatus("Reload the Sora tab once, then reopen the extension.", "error");
         return;
       }
@@ -189,17 +205,15 @@ function syncPopupState() {
   });
 }
 
-slowModeEl.addEventListener("change", () => {
-  const pacing = readPacingFromForm();
-  updatePacingControls(pacing, false);
-  savePacingSettings(pacing);
-});
+function handleSettingsChange() {
+  const settings = readSettingsFromForm();
+  updateControls(settings, false);
+  saveSettings(settings);
+}
 
-slowSecondsEl.addEventListener("change", () => {
-  const pacing = readPacingFromForm();
-  updatePacingControls(pacing, false);
-  savePacingSettings(pacing);
-});
+slowModeEl.addEventListener("change", handleSettingsChange);
+slowSecondsEl.addEventListener("change", handleSettingsChange);
+randomOrderEl.addEventListener("change", handleSettingsChange);
 
 btn.addEventListener("click", () => {
   getActiveSoraTab((tab) => {
@@ -208,39 +222,46 @@ btn.addEventListener("click", () => {
       return;
     }
 
-    const pacing = readPacingFromForm();
-    savePacingSettings(pacing);
+    const settings = readSettingsFromForm();
+    saveSettings(settings);
 
     btn.disabled = true;
     btn.textContent = "Starting...";
-    updatePacingControls(pacing, true);
+    updateControls(settings, true);
     setStatus("Starting publish run in this tab...", "skip");
 
-    sendToActiveTab({ action: "publish_all", pacing }, (response, error) => {
-      if (error) {
-        btn.disabled = false;
-        btn.textContent = "Publish All Drafts";
-        updatePacingControls(savedPacing, false);
-        setStatus("Reload the Sora tab once, then try again.", "error");
-        return;
-      }
+    sendToActiveTab(
+      {
+        action: "publish_all",
+        pacing: settings,
+        randomOrder: settings.randomOrder,
+      },
+      (response, error) => {
+        if (error) {
+          btn.disabled = false;
+          btn.textContent = "Publish All Drafts";
+          updateControls(savedSettings, false);
+          setStatus("Reload the Sora tab once, then try again.", "error");
+          return;
+        }
 
-      if (response?.alreadyRunning) {
-        applyState(response.state);
-        return;
-      }
+        if (response?.alreadyRunning) {
+          applyState(response.state);
+          return;
+        }
 
-      applyState(response?.state || { ...getEmptyState(), pacing });
-      setStatus(
-        `Publishing continues in the page even if this popup closes. ${getPacingSummary(pacing)}`,
-        "success"
-      );
-    });
+        applyState(response?.state || { ...getEmptyState(), pacing: settings, randomOrder: settings.randomOrder });
+        setStatus(
+          `Publishing continues in the page even if this popup closes. ${getSettingsSummary(settings)}`,
+          "success"
+        );
+      }
+    );
   });
 });
 
-chrome.storage.local.get(DEFAULT_PACING, (storedSettings) => {
-  savedPacing = normalizePacingSettings(storedSettings);
-  updatePacingControls(savedPacing, false);
+chrome.storage.local.get(DEFAULT_SETTINGS, (storedSettings) => {
+  savedSettings = normalizeSettings(storedSettings);
+  updateControls(savedSettings, false);
   syncPopupState();
 });

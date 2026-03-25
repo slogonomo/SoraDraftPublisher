@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Sora Bulk Publisher",
-  "version": "1.4",
+  "version": "1.8",
   "description": "Publish all Sora drafts to public, trimming caption text below 2000 characters when needed",
   "permissions": ["activeTab", "storage"],
   "content_scripts": [

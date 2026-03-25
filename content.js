@@ -4,19 +4,31 @@
   const FAST_POST_DELAY_MS = 4000;
   const FAST_RATE_LIMIT_BASE_DELAY_MS = 15000;
   const SERVER_RETRY_DELAY_MS = 5000;
-  const MAX_RETRIES = 3;
+  const MAX_AUTH_RETRIES = 3;
+  const MAX_SERVER_RETRIES = 3;
+  const MAX_RATE_LIMIT_RETRIES = 8;
   const MAX_RATE_LIMIT_DELAY_MS = 600000;
   const MAX_POST_TEXT_LENGTH = 1999;
   const LOG_HISTORY_LIMIT = 250;
   const DEFAULT_SLOW_MODE_SECONDS = 30;
+  const DRAFT_CACHE_STORAGE_KEY = "draftQueueCache";
+  const DRAFT_CACHE_VERSION = 1;
 
   let accessToken = null;
+  let cacheWarningShown = false;
   const runState = createInitialRunState();
 
   function createDefaultPacing() {
     return {
       slowMode: false,
       slowModeSeconds: DEFAULT_SLOW_MODE_SECONDS,
+    };
+  }
+
+  function normalizePublishOptions(options = {}) {
+    return {
+      pacing: normalizePacingSettings(options.pacing || options),
+      randomOrder: Boolean(options.randomOrder),
     };
   }
 
@@ -69,6 +81,7 @@
       startedAt: null,
       finishedAt: null,
       pacing: createDefaultPacing(),
+      randomOrder: false,
       postDelayMs: FAST_POST_DELAY_MS,
       cooldownUntil: 0,
     };
@@ -79,6 +92,36 @@
   function send(type, data = {}) {
     chrome.runtime.sendMessage({ type, ...data }, () => {
       void chrome.runtime.lastError;
+    });
+  }
+
+  function storageGet(keys) {
+    return new Promise((resolve) => {
+      chrome.storage.local.get(keys, resolve);
+    });
+  }
+
+  function storageSet(items) {
+    return new Promise((resolve, reject) => {
+      chrome.storage.local.set(items, () => {
+        if (chrome.runtime.lastError) {
+          reject(new Error(chrome.runtime.lastError.message));
+          return;
+        }
+        resolve();
+      });
+    });
+  }
+
+  function storageRemove(keys) {
+    return new Promise((resolve, reject) => {
+      chrome.storage.local.remove(keys, () => {
+        if (chrome.runtime.lastError) {
+          reject(new Error(chrome.runtime.lastError.message));
+          return;
+        }
+        resolve();
+      });
     });
   }
 
@@ -97,19 +140,22 @@
       startedAt: runState.startedAt,
       finishedAt: runState.finishedAt,
       pacing: { ...runState.pacing },
+      randomOrder: runState.randomOrder,
       postDelayMs: runState.postDelayMs,
       cooldownUntil: runState.cooldownUntil,
     };
   }
 
-  function resetRunState(pacingSettings) {
-    const pacing = normalizePacingSettings(pacingSettings);
+  function resetRunState(options) {
+    const publishOptions = normalizePublishOptions(options);
+    cacheWarningShown = false;
 
     Object.assign(runState, createInitialRunState(), {
       isRunning: true,
       startedAt: Date.now(),
-      pacing,
-      postDelayMs: getConfiguredBaseDelayMs(pacing),
+      pacing: publishOptions.pacing,
+      randomOrder: publishOptions.randomOrder,
+      postDelayMs: getConfiguredBaseDelayMs(publishOptions.pacing),
     });
   }
 
@@ -136,17 +182,43 @@
     send("done");
   }
 
+  function noteCacheWarning(message) {
+    if (cacheWarningShown) {
+      return;
+    }
+
+    cacheWarningShown = true;
+    emitLog(message, "error");
+  }
+
   function describePacing(pacing = runState.pacing) {
     if (!pacing.slowMode) {
-      return "Fast mode: 4s between drafts, with 429 retries at 15s, 30s, then 60s.";
+      return "Fast mode: 4s between drafts, with 429 retries growing from 15s up to a 10 minute cap.";
     }
 
     return (
       `Slow mode: ${pacing.slowModeSeconds}s between drafts, with 429 retries at ` +
       `${Math.ceil(getRecommendedRateLimitBackoffMs(1, pacing) / 1000)}s, ` +
       `${Math.ceil(getRecommendedRateLimitBackoffMs(2, pacing) / 1000)}s, then ` +
-      `${Math.ceil(getRecommendedRateLimitBackoffMs(3, pacing) / 1000)}s.`
+      `${Math.ceil(getRecommendedRateLimitBackoffMs(3, pacing) / 1000)}s before continuing to double up to a 10 minute cap.`
     );
+  }
+
+  function describeOrder() {
+    return runState.randomOrder
+      ? "Random order is enabled for this run."
+      : "Posting drafts in the fetched order.";
+  }
+
+  function formatAge(ms) {
+    const minutes = Math.max(1, Math.round(ms / 60000));
+
+    if (minutes < 60) {
+      return `${minutes} minute${minutes === 1 ? "" : "s"}`;
+    }
+
+    const hours = Math.round(minutes / 60);
+    return `${hours} hour${hours === 1 ? "" : "s"}`;
   }
 
   function parseRetryAfterMs(retryAfterHeader) {
@@ -251,10 +323,27 @@
 
   // Fetch all draft pages
 
+  function normalizeDraftForPublish(draft) {
+    return {
+      id: draft.id,
+      kind: draft.kind || null,
+      generation_id: draft.generation_id || null,
+      prompt: typeof draft.prompt === "string" ? draft.prompt : "",
+      title: typeof draft.title === "string" ? draft.title : "",
+      caption: typeof draft.caption === "string" ? draft.caption : "",
+      assets: Boolean(draft.assets),
+    };
+  }
+
+  function getDraftLabel(draft) {
+    return (draft.prompt || draft.caption || draft.title || draft.id || "untitled").substring(0, 50);
+  }
+
   async function fetchAllDrafts() {
     let cursor = null;
     let allItems = [];
     let page = 0;
+    let usedPartialResults = false;
 
     while (true) {
       page++;
@@ -263,12 +352,34 @@
 
       emitLog(`Fetching drafts page ${page}...`);
 
-      const res = await fetch(url, { headers: authHeaders() });
+      let res;
+      try {
+        res = await fetch(url, { headers: authHeaders() });
+      } catch (error) {
+        if (allItems.length) {
+          usedPartialResults = true;
+          emitLog(
+            `Draft fetch stopped after ${allItems.length} drafts (${error.message}). Continuing with the saved partial queue.`,
+            "skip"
+          );
+          break;
+        }
+        throw error;
+      }
+
       if (!res.ok) {
         if (res.status === 401) {
           emitLog("Token expired, refreshing...", "skip");
           await getToken();
           continue;
+        }
+        if (allItems.length) {
+          usedPartialResults = true;
+          emitLog(
+            `Draft fetch stopped with ${res.status} after ${allItems.length} drafts. Continuing with the saved partial queue.`,
+            "skip"
+          );
+          break;
         }
         throw new Error("Drafts fetch failed: " + res.status);
       }
@@ -276,14 +387,123 @@
       const data = await res.json();
       if (!data.items || data.items.length === 0) break;
 
-      allItems = allItems.concat(data.items);
+      allItems = allItems.concat(data.items.map(normalizeDraftForPublish));
+      await saveDraftCache(allItems);
       emitLog(`  Got ${data.items.length} drafts (${allItems.length} total)`);
 
       if (!data.cursor) break;
       cursor = data.cursor;
     }
 
-    return allItems;
+    return {
+      drafts: allItems,
+      usedPartialResults,
+    };
+  }
+
+  function shuffleDrafts(items) {
+    const shuffledItems = items.slice();
+
+    for (let i = shuffledItems.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [shuffledItems[i], shuffledItems[j]] = [shuffledItems[j], shuffledItems[i]];
+    }
+
+    return shuffledItems;
+  }
+
+  async function loadDraftCache() {
+    try {
+      const result = await storageGet(DRAFT_CACHE_STORAGE_KEY);
+      const cache = result[DRAFT_CACHE_STORAGE_KEY];
+
+      if (
+        !cache ||
+        cache.version !== DRAFT_CACHE_VERSION ||
+        !Array.isArray(cache.remainingDrafts) ||
+        cache.remainingDrafts.length === 0
+      ) {
+        return null;
+      }
+
+      return cache;
+    } catch (error) {
+      noteCacheWarning("Couldn't read the local draft cache, so this run will refetch from Sora.");
+      return null;
+    }
+  }
+
+  async function saveDraftCache(remainingDrafts) {
+    try {
+      if (!remainingDrafts.length) {
+        await storageRemove(DRAFT_CACHE_STORAGE_KEY);
+        return true;
+      }
+
+      await storageSet({
+        [DRAFT_CACHE_STORAGE_KEY]: {
+          version: DRAFT_CACHE_VERSION,
+          updatedAt: Date.now(),
+          remainingDrafts,
+        },
+      });
+      return true;
+    } catch (error) {
+      noteCacheWarning("Couldn't save the local draft cache, so resume may require a refetch.");
+      return false;
+    }
+  }
+
+  async function clearDraftCache() {
+    try {
+      await storageRemove(DRAFT_CACHE_STORAGE_KEY);
+    } catch (error) {
+      noteCacheWarning("Couldn't clear the local draft cache after finishing the run.");
+    }
+  }
+
+  async function getDraftsForRun() {
+    const cachedQueue = await loadDraftCache();
+
+    if (cachedQueue) {
+      const cacheAge = Date.now() - cachedQueue.updatedAt;
+      emitLog(
+        `Using cached draft queue with ${cachedQueue.remainingDrafts.length} remaining drafts from ${formatAge(cacheAge)} ago.`,
+        "skip"
+      );
+
+      const drafts = runState.randomOrder
+        ? shuffleDrafts(cachedQueue.remainingDrafts)
+        : cachedQueue.remainingDrafts.slice();
+
+      if (runState.randomOrder) {
+        emitLog("Randomized cached draft order for this run.");
+        await saveDraftCache(drafts);
+      }
+
+      return drafts;
+    }
+
+    emitLog("Fetching all drafts...");
+    const fetchResult = await fetchAllDrafts();
+    const drafts = runState.randomOrder ? shuffleDrafts(fetchResult.drafts) : fetchResult.drafts;
+
+    if (runState.randomOrder) {
+      emitLog("Randomized draft order for this run.");
+    }
+
+    const cacheSaved = await saveDraftCache(drafts);
+    if (cacheSaved) {
+      emitLog(`Saved ${drafts.length} drafts to the local resume cache.`, "skip");
+    }
+    if (fetchResult.usedPartialResults) {
+      emitLog(
+        "Continuing with a partial draft queue because the full draft fetch did not complete.",
+        "skip"
+      );
+    }
+
+    return drafts;
   }
 
   // Post a single draft
@@ -329,26 +549,29 @@
       };
     }
 
-    if (res.status === 401 && attempt <= MAX_RETRIES) {
+    if (res.status === 401 && attempt <= MAX_AUTH_RETRIES) {
       emitLog("  Token expired, refreshing...", "skip");
       await getToken();
       return postDraft(draft, attempt + 1);
     }
 
-    if (res.status === 429 && attempt <= MAX_RETRIES) {
+    if (res.status === 429) {
       const wait = noteRateLimit(res, attempt);
-      emitLog(
-        `  Rate limited, waiting ${Math.ceil(wait / 1000)}s (retry ${attempt}/${MAX_RETRIES})...`,
-        "skip"
-      );
-      await sleep(wait);
-      return postDraft(draft, attempt + 1);
+
+      if (attempt <= MAX_RATE_LIMIT_RETRIES) {
+        emitLog(
+          `  Rate limited, waiting ${Math.ceil(wait / 1000)}s (retry ${attempt}/${MAX_RATE_LIMIT_RETRIES})...`,
+          "skip"
+        );
+        await sleep(wait);
+        return postDraft(draft, attempt + 1);
+      }
     }
 
-    if (res.status >= 500 && attempt <= MAX_RETRIES) {
+    if (res.status >= 500 && attempt <= MAX_SERVER_RETRIES) {
       const wait = Math.max(getConfiguredBaseDelayMs(), SERVER_RETRY_DELAY_MS * attempt);
       emitLog(
-        `  Server error ${res.status}, retrying in ${Math.ceil(wait / 1000)}s (${attempt}/${MAX_RETRIES})...`,
+        `  Server error ${res.status}, retrying in ${Math.ceil(wait / 1000)}s (${attempt}/${MAX_SERVER_RETRIES})...`,
         "skip"
       );
       await sleep(wait);
@@ -365,32 +588,34 @@
 
   // Main flow
 
-  async function publishAll(pacingSettings) {
+  async function publishAll(options) {
     if (runState.isRunning) {
       return false;
     }
 
-    resetRunState(pacingSettings);
+    resetRunState(options);
 
     try {
       emitStats();
       emitLog("Authenticating...");
       emitLog(`Pacing: ${describePacing()}`);
+      emitLog(`Order: ${describeOrder()}`);
       await getToken();
-      emitLog("Fetching all drafts...");
-
-      const drafts = await fetchAllDrafts();
+      const drafts = await getDraftsForRun();
       runState.total = drafts.length;
       emitLog(`Found ${runState.total} drafts.`);
       emitStats();
 
+      let deferredFailedDrafts = [];
+
       for (let i = 0; i < drafts.length; i++) {
         const draft = drafts[i];
-        const label = (draft.prompt || draft.caption || draft.id).substring(0, 50);
+        const label = getDraftLabel(draft);
 
         if (draft.kind === "sora_content_violation") {
           emitLog(`[${i + 1}/${runState.total}] SKIP (violation): ${label}`, "skip");
           runState.skipped++;
+          await saveDraftCache(drafts.slice(i + 1).concat(deferredFailedDrafts));
           emitStats();
           continue;
         }
@@ -413,8 +638,11 @@
         } else {
           emitLog(`  Failed: ${result.reason}`, "error");
           runState.failed++;
+          deferredFailedDrafts.push(draft);
         }
 
+        const remainingDrafts = drafts.slice(i + 1).concat(deferredFailedDrafts);
+        await saveDraftCache(remainingDrafts);
         emitStats();
 
         if (i < drafts.length - 1) {
@@ -426,6 +654,15 @@
         `\nDone! Posted: ${runState.posted}, Skipped: ${runState.skipped}, Failed: ${runState.failed}`,
         "success"
       );
+      if (deferredFailedDrafts.length) {
+        await saveDraftCache(deferredFailedDrafts);
+        emitLog(
+          `Kept ${deferredFailedDrafts.length} failed drafts in the local resume cache for the next run.`,
+          "skip"
+        );
+      } else {
+        await clearDraftCache();
+      }
     } catch (error) {
       emitLog("Fatal error: " + error.message, "error");
     } finally {
@@ -444,7 +681,10 @@
         return;
       }
 
-      publishAll(msg.pacing);
+      publishAll({
+        pacing: msg.pacing,
+        randomOrder: msg.randomOrder,
+      });
       sendResponse({ started: true, state: getSerializableState() });
       return;
     }

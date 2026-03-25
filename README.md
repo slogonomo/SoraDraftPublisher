@@ -4,12 +4,12 @@ Chrome extension for publishing all visible Sora drafts from `sora.chatgpt.com`,
 
 ## Download
 
-Current packaged build: [SoraDraftPublisher-v1.4.zip](./SoraDraftPublisher-v1.4.zip)
+Current packaged build: [SoraDraftPublisher-v1.8.zip](./SoraDraftPublisher-v1.8.zip)
 
 ## Decompress
 
-1. Download [SoraDraftPublisher-v1.4.zip](./SoraDraftPublisher-v1.4.zip).
-2. Double-click the zip file in Finder to extract it, or run `unzip SoraDraftPublisher-v1.4.zip -d SoraDraftPublisher-v1.4`.
+1. Download [SoraDraftPublisher-v1.8.zip](./SoraDraftPublisher-v1.8.zip).
+2. Double-click the zip file in Finder to extract it, or run `unzip SoraDraftPublisher-v1.8.zip -d SoraDraftPublisher-v1.8`.
 3. In Chrome, load the extracted folder with **Load unpacked**.
 
 ## Install
@@ -33,3 +33,7 @@ Current packaged build: [SoraDraftPublisher-v1.4.zip](./SoraDraftPublisher-v1.4.
 - The current run stays attached to the active Sora tab, so reloading that tab will interrupt the in-progress publish job.
 - The publisher now slows itself down after `429 Too Many Requests` responses and keeps a longer cooldown before continuing.
 - Slow mode can be enabled from the popup with a custom per-draft delay. At the default 30 seconds, `429` retries back off to at least 60, 120, and 240 seconds.
+- Randomize publish order can be enabled from the popup so grouped drafts are mixed before posting.
+- The remaining draft queue is cached locally during a run, so restarting after an interruption resumes from the saved queue instead of refetching every draft again.
+- If the full draft fetch fails after some pages have already loaded, the extension keeps that partial queue and continues posting from it instead of throwing the whole run away.
+- `429 Too Many Requests` now uses a longer capped exponential retry schedule, while `5xx` and auth retries stay on the shorter path.
